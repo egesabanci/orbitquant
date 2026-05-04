@@ -44,9 +44,9 @@ OrbitQuant asks the next question:
 | File | Role |
 | --- | --- |
 | [`proposals.md`](./proposals.md) | Main proposal backlog for future OrbitQuant experiments. |
-| [`turboquant-paper.pdf`](./turboquant-paper.pdf) | Baseline TurboQuant paper and primary target for further optimization. |
-| [`quantized-johnson-lindenstrauss.pdf`](./quantized-johnson-lindenstrauss.pdf) | QJL paper, used especially for residual and unbiased inner-product ideas. |
-| [`polar-quant.pdf`](./polar-quant.pdf) | PolarQuant paper, used for polar-coordinate and random-preconditioning hybrid ideas. |
+| [`papers/turboquant-paper.pdf`](./papers/turboquant-paper.pdf) | Baseline TurboQuant paper and primary target for further optimization. |
+| [`papers/quantized-johnson-lindenstrauss.pdf`](./papers/quantized-johnson-lindenstrauss.pdf) | QJL paper, used especially for residual and unbiased inner-product ideas. |
+| [`papers/polar-quant.pdf`](./papers/polar-quant.pdf) | PolarQuant paper, used for polar-coordinate and random-preconditioning hybrid ideas. |
 
 ## Main Research Baselines
 
@@ -167,4 +167,4 @@ The immediate goal is to move from proposal backlog to measured experiments.
 
 ## License
 
-No license file is currently included. Add one before publishing reusable implementation code.
+This project is licensed under the MIT License. See [`LICENSE`](./LICENSE).
