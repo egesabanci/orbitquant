@@ -95,3 +95,47 @@ The rotation matrix Π doesn't need to be random. Initialize it via **SVD of the
 ### 20. Distortion Metric Aligned with Token Prediction
 
 The current analysis minimizes MSE and inner product error. But what actually matters for LLMs is **KL divergence in the output token distribution**. Derive a quantization scheme that directly minimizes expected KL divergence between softmax outputs with and without quantization. This is the true optimization target — everything else is a proxy. Even a first-order Taylor expansion of the softmax could yield a weighted inner-product distortion metric that's better aligned than raw MSE.
+
+---
+
+## Additional Proposals Worth Trying
+
+### 21. Analytical Debiasing for TurboQuant MSE
+
+`TurboQuant_mse` is already excellent for reconstruction, but its dequantized vectors are biased for inner product estimation at low bit-widths. Instead of always spending a full residual QJL stage, precompute a **codebook-specific scalar debiasing factor** (or a small per-bucket correction table) so that `<q, DeQuant_mse(k)>` is much closer to unbiased. The 1-bit case already has a clean multiplicative bias; higher bit-widths should have measurable calibration curves from the Lloyd-Max centroids and Beta coordinate distribution. This is a cheap path to test because it changes only dequantization/scoring, not the encoded representation.
+
+### 22. Variable-Size Residual QJL
+
+`TurboQuant_prod` currently spends exactly one additional bit per coordinate on the residual QJL stage. Generalize this to a residual sketch dimension `m` that can be smaller or larger than `d`, then optimize the split between `(b_mse, m)` under a fixed total bit budget. For easy layers or small residuals, `m < d` may preserve unbiasedness while saving memory; for fragile layers, a slightly larger residual sketch may outperform adding another scalar bit everywhere.
+
+### 23. Quantized Norm and Radius Storage
+
+The papers remove scale/zero-point overhead for coordinates, but still store scalar side information: QJL stores key norms, PolarQuant stores radii, and `TurboQuant_prod` stores residual norms. These scalars are small but persistent overhead at long context. Quantize them in **log space**, share them per block/head when possible, or use a tiny exponent-mantissa format tuned to observed KV norm ranges. This should be tested because it directly improves real compression ratio without touching the core vector quantizer.
+
+### 24. Separate Key and Value Quantization Objectives
+
+Keys and values do not need the same distortion metric. Keys should preserve logits and attention ordering, while values should preserve the attention-weighted output after softmax. Use `TurboQuant_prod`-style unbiased inner product preservation for keys, but use an MSE or attention-weighted MSE quantizer for values. This can produce better quality at the same average KV size because value errors only matter in proportion to attention mass.
+
+### 25. RoPE-Compatible Rotations
+
+Random rotations, Hadamard transforms, and learned rotations all add serving complexity unless they can be folded into the model or fused cheaply. For RoPE-based models, design preconditioners that **commute with RoPE's 2D rotation blocks** or operate blockwise inside RoPE coordinate pairs. If the transform can be folded into Q/K projections or applied before RoPE without changing attention semantics, TurboQuant gets much easier to deploy in existing inference stacks.
+
+### 26. Progressive Embedded Codebooks
+
+Build nested codebooks where a 3-bit representation extends a 2-bit representation, and a 4-bit representation extends the 3-bit one. This enables precision upgrades without re-quantizing: start all tokens at low precision, then append refinement bits for important heads, recent tokens, outliers, or high-attention candidates. It also gives a clean memory-pressure knob for serving systems.
+
+### 27. Exact Finite-Dimension Codebooks
+
+The analysis often leans on high-dimensional Gaussian approximations, but practical head dimensions are commonly 64 or 128, and outlier splits can reduce the effective dimension further. Precompute Lloyd-Max codebooks using the **exact finite-d Beta coordinate distribution** for each actual dimension used by the model. This is low risk and may improve low-bit distortion without changing the algorithmic structure.
+
+### 28. Orthogonalized Residual Sketches
+
+QJL reports empirical gains from orthogonalizing JL rows. Apply the same idea specifically to TurboQuant's residual QJL stage: use orthogonalized Gaussian sketches, SRHT-style sketches, or other structured orthogonal sketches for the residual. This is likely to reduce estimator variance with minimal conceptual change, and it pairs naturally with variable-size residual QJL.
+
+### 29. Age- and Role-Aware KV Precision
+
+Treat KV tokens differently based on their role in generation. Recent generated tokens, system/prefix tokens, delimiter tokens, and attention sinks often deserve higher precision than old bulk context tokens. This is distinct from query-conditional refinement: it is a simple static serving policy that can be decided at cache write time and should be easy to combine with TurboQuant's current streaming setup.
+
+### 30. ANN-Specific TurboQuant Scoring Path
+
+For nearest-neighbor search, implement asymmetric scoring directly over TurboQuant codes and rerank only a small candidate set in full precision or higher precision. The paper already shows strong recall and near-zero indexing time; the next systems win is avoiding full dequantization during search. This would make TurboQuant more compelling as a practical vector database primitive, not just a compression method.
