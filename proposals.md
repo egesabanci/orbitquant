@@ -1,300 +1,342 @@
 # TurboQuant Optimization Proposals
 
-> **Updated 2026-05-24** — Reorganized after deep analysis of all three papers (TurboQuant, QJL, PolarQuant). Proposals are now grouped by priority tier with rationale grounded in paper specifics (Beta coordinate distribution, 2.7× optimality gap, QJL Figure 2 outlier patterns, Lemma guarantees, etc.). A "Deferred / Not Recommended" section at the bottom explains why certain ideas were cut or postponed. New proposals discovered during the analysis are marked **[NEW]**.
+> **Updated 2026-05-27** — Re-audited against TurboQuant, QJL, PolarQuant, and recent KV-cache quantization work. The list now separates foundational measurement infrastructure from algorithm ideas, corrects places where Haar-rotation theory was being over-applied to structured transforms, adds stronger outlier/rotation/budgeting proposals, and moves weaker active ideas to Deferred / Not Recommended.
 
 ---
 
 ## P0 — Foundational: Implement First
 
-These are the highest-leverage, lowest-ambiguity proposals. They either unlock everything else or deliver outsized gains for near-zero risk. Start here.
+These items are needed before the rest of the backlog can be evaluated honestly. The immediate risk is not lack of ideas; it is accepting a structured-transform or low-bit trick before measuring whether it preserves the assumptions TurboQuant relies on.
 
-### P0.1 — Structured Fast Rotations (Hadamard + Diagonal Sign Flip)
+### P0.1 — Reference Implementation and Rotation Validation Harness
 
-Right now, TurboQuant's biggest practical bottleneck is the **O(d²) dense random rotation** Π·x (a d×d matrix multiply). But you don't *actually* need a uniform random rotation — you just need enough mixing to decorrelate coordinates. A **Hadamard + random diagonal sign flip** sequence (HD³) costs **O(d log d)**, is perfectly GPU-butterfly-friendly, and is a known approximate JL transform. The Beta concentration and near-independence properties from TurboQuant Lemma 1 should still hold asymptotically. This one change makes TurboQuant go from "theoretically fast" to "actually fast at serving scale."
+Build a pure PyTorch/CPU reference implementation of `TurboQuant_mse`, `TurboQuant_prod`, and QJL, then add a validation harness for rotations and codebooks.
 
-> **Paper grounding:** TurboQuant Lemma 1 — coordinate distribution after rotation is Beta(d/2, (d-1)/2). The key requirement is uniform distribution on S^{d-1}, which Hadamard + sign flip achieves (it's an orthogonal transform). The near-independence of coordinates in high dimensions [55] holds for any orthogonal matrix applied to an arbitrary input, not just random rotations. What changes is the degree of mixing, but for d ≥ 64 the concentration effects dominate.
+The harness should compare dense Haar random rotation, dense Gaussian-QR rotation, Hadamard/sign-flip variants, and no rotation on:
 
-### P0.2 — Exact Finite-Dimension Codebooks
+- coordinate distribution fit against the finite-d Beta law;
+- coordinate covariance and higher-order dependence;
+- MSE distortion for `b = 1..4`;
+- inner-product bias and variance;
+- attention-logit error on real KV tensors;
+- runtime and memory overhead.
 
-The theoretical analysis in TurboQuant leans on high-dimensional Gaussian approximations (`N(0, 1/d)`), but practical head dimensions are commonly 64 or 128. Precompute Lloyd-Max codebooks using the **exact finite-d Beta coordinate distribution** from Lemma 1:
+This should be the first experiment because several later proposals depend on structured rotations behaving "random enough" in practical head dimensions.
 
+> **Paper grounding:** TurboQuant's guarantees come from random rotation producing a uniformly random point on the sphere, whose coordinates follow Lemma 1's Beta distribution. Structured transforms may work very well in practice, but they do not inherit that exact guarantee automatically.
+
+### P0.2 — Structured Fast Rotations (Hadamard + Diagonal Sign Flip)
+
+Replace the dense `O(d^2)` random rotation with a fast structured transform such as `D1 H D2 H D3 H`, where `H` is a normalized Walsh-Hadamard transform and each `D` is a random diagonal sign matrix. This gives `O(d log d)` compute, tiny parameter storage, and a GPU-friendly butterfly structure.
+
+The claim should be empirical, not overstated: a Hadamard/sign-flip stack is orthogonal and mixes coordinates, but it is not the same distribution as a Haar random rotation. Test single-round HD, multi-round HDHD/HDHDH, optional random permutation, and the outlier-aware permutation in P1.4.
+
+> **Paper grounding:** TurboQuant uses a random rotation to make coordinates Beta-distributed and nearly independent. PolarQuant and recent rotation-based KV-cache methods show fast Hadamard-style preconditioning is practical, but the exact distortion bounds need validation under the structured replacement.
+
+### P0.3 — Exact Finite-Dimension Codebooks
+
+Precompute Lloyd-Max codebooks using the exact finite-dimensional coordinate distribution from TurboQuant Lemma 1:
+
+```text
+f_X(x) = Gamma(d/2) / (sqrt(pi) * Gamma((d-1)/2)) * (1 - x^2)^((d-3)/2)
 ```
-f_X(x) = Γ(d/2) / (√π · Γ((d-1)/2)) · (1 - x²)^{(d-3)/2}
-```
 
-for each actual dimension used by the model. This is a one-time offline computation with zero algorithmic change — just swap the codebook table. Should measurably improve low-bit distortion at b=1–4 where the Gaussian approximation is weakest.
+for the actual head dimensions used by target models, especially `d = 64` and `d = 128`.
 
-> **Paper grounding:** TurboQuant Theorem 1 — the distortion bound D_mse = d · C(f_X, b) depends directly on how well the Lloyd-Max codebook fits the true f_X. The paper already notes that for b=1,2 the Gaussian-approximated centroids are `±√(2/π)/√d` and `{±0.453/√d, ±1.51/√d}`. Exact codebooks for d=64,128 will tighten these values.
+For Haar rotations, these are the theoretically correct scalar codebooks. For structured rotations, compare them against empirical codebooks learned from rotated calibration tensors. If the empirical codebook wins materially, keep both paths: exact-Beta for theory and empirical for production experiments.
 
-### P0.3 [NEW] — Layer-Aware Mixed Mode: MSE for Shallow, Product for Deep
+> **Paper grounding:** TurboQuant Theorem 1 gives `D_mse = d * C(f_X, b)`. The scalar quantizer quality depends directly on matching `f_X`; the Gaussian approximation is weakest at low bit-widths and small practical head dimensions.
 
-The QJL paper's Figure 2 is striking: shallow layers have **zero outliers**, deep layers have heavy outliers concentrated in ~4 fixed channels. This directly motivates a split strategy: use `TurboQuant_mse` (cheaper, no residual QJL overhead) for shallow layers where inner-product bias from outliers doesn't exist, and `TurboQuant_prod` only for deep layers where unbiased inner-product estimation actually matters.
+### P0.4 — Minimal KV-Cache Evaluation Harness
 
-This is a simpler, more principled version of proposal P1.1 (adaptive bit allocation). Instead of tuning continuous bit budgets per layer, it makes one binary decision per layer based on a well-documented empirical fact. The QJL paper's data gives us the decision rule for free.
+Add a small decoder-only model integration that can capture real K/V tensors, quantize them during prefill/decode, and report:
 
-> **Paper grounding:** QJL Figure 2 — "In the initial layers, no significant outlier patterns are observed. However, in the deeper layers, a few channels (approximately four) exhibit visibly larger magnitudes." TurboQuant Theorem 2 — the inner-product distortion bound scales with ‖y‖²/d · 1/4^b, so for layers without outliers the residual QJL stage is paying a bit budget cost for a problem that doesn't exist.
+- key reconstruction error;
+- value reconstruction error;
+- attention-logit bias/error;
+- attention output error;
+- generated-token quality on a tiny deterministic task set;
+- memory ratio including side information.
+
+Synthetic vector tests are necessary but insufficient. Several proposals optimize MSE while the real failure mode may be attention-logit drift or value aggregation error.
 
 ---
 
 ## P1 — High Impact, Low Implementation Risk
 
-These don't change the core algorithm and deliver strong practical gains. Implement after the P0 items.
+These should come after P0 because they use the same reference implementation and evaluation harness. They are mostly policy and calibration changes, not kernel work.
 
-### P1.1 — Adaptive Bit Allocation Across Layers and Heads
+### P1.1 — Logit-Error Mixed Mode Across Layers and Heads
 
-Not all layers and heads are created equal. The QJL paper's Figure 2 shows early layers have **no outliers**, deep layers have **heavy outliers**. Rather than spending the same bit budget everywhere, allocate bits **adaptively**: more bits to deeper layers, fewer to shallow ones; more bits to critical attention heads, fewer to redundant ones. The total bit budget stays the same, but the *rate-distortion* improves dramatically because you're spending precision where the model is actually sensitive.
+Use `TurboQuant_mse` where it is empirically safe and `TurboQuant_prod` where unbiased inner-product estimation is actually needed. The decision rule should be based on measured attention-logit bias/error per layer and head, not only on outlier presence.
 
-> **Note:** This is the continuous-budget generalization of P0.3. P0.3 gives a simple binary split as a quick win; P1.1 tunes the exact allocation once the infrastructure exists.
+The earlier version of this idea overclaimed that shallow layers without outliers do not need unbiased correction. That is too strong: `TurboQuant_mse` can be biased even without visible outliers, especially at low bit-width. The better test is direct logit error under cached queries.
 
-### P1.2 — Separate Key and Value Quantization Objectives
+> **Paper grounding:** TurboQuant Section 3.2 proves MSE-optimal quantizers are biased for inner products. QJL Figure 2 shows outliers are layer-dependent. Combining both suggests a measured mixed-mode policy rather than a fixed all-layer choice.
 
-Keys and values serve fundamentally different roles in attention. Keys determine the attention distribution via inner products with the query — they need unbiased inner-product estimation (TurboQuant_prod). Values are aggregated via attention-weighted summation — they need good reconstruction where attention mass is high, but unbiasedness is irrelevant. Use `TurboQuant_prod` for keys and an MSE or attention-weighted MSE quantizer for values.
+### P1.2 — Separate Key/Value Objectives with Key-Favored Bit Budgets
 
-This is a clean theoretical insight that costs nothing to implement and should improve quality at the same average KV size, because value errors only matter in proportion to attention mass.
+Keys and values need different objectives. Keys control attention logits, so key quantization should prioritize low inner-product error and low bias. Values are averaged by attention weights, so they need good reconstruction under the actual attention distribution.
 
-> **Paper grounding:** TurboQuant defines two distortion measures — D_mse (Eq. 1) and D_prod (Eq. 2). The paper applies one or the other uniformly. But §1.1 notes that for values, "a standard token-wise quantization is very effective and efficient in practice" (QJL §3.2). The key insight: keys need Theorem 2's unbiased guarantee; values only need Theorem 1's MSE bound.
+Start with `TurboQuant_prod` or debiased MSE for keys and `TurboQuant_mse` or attention-weighted MSE for values. Also test asymmetric bit budgets such as `K=4, V=2` against the reverse allocation at the same average KV size.
+
+> **External grounding:** [KV-AdaQuant / "More for Keys, Less for Values"](https://arxiv.org/abs/2502.15075) reports that keys are more sensitive to quantization than values and that assigning more bits to keys can strongly outperform the reverse allocation at equal budget.
 
 ### P1.3 — Quantized Norm and Radius Storage
 
-The papers remove scale/zero-point overhead for coordinates, but still store scalar side information: QJL stores key norms ‖kᵢ‖₂, PolarQuant stores radii, and TurboQuant_prod stores residual norms. These scalars are small but **persistent overhead** at long context — one float per token per head. At sequence length 128K with 32 heads, that's 128K × 32 × 4 bytes = 16 MB in FP32, or 8 MB in FP16. It's pure overhead.
+The papers remove coordinate scale/zero-point overhead, but still store scalar side information: QJL stores key norms, PolarQuant stores radii, and TurboQuant_prod stores residual norms.
 
-Quantize norms in **log space** with a tiny shared format (e.g., 8-bit log-scale with head-specific bias/scale). The dynamic range of KV norms is typically narrow (< 10×), so 8 bits is more than sufficient. This directly improves real compression ratio without touching the core vector quantizer.
+Quantize these scalars in log space with a small shared format, for example 8-bit log-scale with per-layer/head calibration. Measure both quality and true memory ratio. This is low-risk because it does not change the vector code itself.
 
-> **Paper grounding:** QJL §3.1 — "store the quantized vector k̃ᵢ and the key norm νᵢ in the cache." TurboQuant §1.1 — "we can compute and store the L2 norms in floating-point precision and rescale." Both papers acknowledge the overhead but don't optimize it.
+> **Paper grounding:** QJL stores `(sign(Sk_i), ||k_i||_2)`. TurboQuant_prod stores a residual norm. PolarQuant stores radius. These are small per token, but persistent at long context.
 
-### P1.4 [NEW] — Entropy Coding Layer on Quantized Indices
+### P1.4 — Outlier-Aware Hadamard Channel Permutation
 
-After scalar quantization, adjacent coordinates in the rotated space often land in the same quantization bucket, especially near-zero coordinates. For b=1–2 on near-Gaussian coordinates, run-length encoding (RLE) the index stream can save 10–30% additional space.
+Before applying a Hadamard transform, reorder channels so persistent outlier channels are spread across different butterfly groups. This keeps the speed of FWHT while reducing the chance that a few large channels dominate a local mixing path.
 
-This is independent of the quantization algorithm — it's a pure entropy coding layer applied after `Quant_mse`. It has zero impact on distortion because it's lossless on the already-quantized indices. The only cost is a small decode pass during dequantization, which is trivially fast.
+Use a calibration pass to rank channels by magnitude or contribution to logit error, then generate a fixed per-layer/head permutation. Compare random permutation, bit-reversal permutation, and outlier-aware permutation.
 
-> **Relationship to P0.2:** Exact finite-d codebooks produce tighter clusters around centroids, which increases the probability of adjacent indices being identical, making RLE even more effective. These two proposals compound.
+> **External grounding:** [RotateKV](https://arxiv.org/abs/2501.16383) uses channel reordering with FWHT-style rotations to adapt to channel-wise outlier distributions while preserving fast structured rotation.
+
+### P1.5 — Attention-Sink, Recent-Token, and Outlier-Token Protection
+
+Keep a tiny subset of tokens at higher precision: attention sinks, system/prefix tokens, delimiter-like tokens, very recent tokens, and dynamically detected outlier tokens. The protected pool should be tiny enough that memory ratio barely moves.
+
+This is a narrower and more useful version of age/role-aware precision. It should be implemented as a cache-write policy with a fixed high-precision quota, then tested against uniform quantization at the same memory budget.
+
+> **External grounding:** [RotateKV](https://arxiv.org/abs/2501.16383) uses attention-sink-aware quantization, and [outlier-token tracing work](https://arxiv.org/abs/2505.10938) reports that a small subset of unusual tokens can dominate KV quantization error.
+
+### P1.6 — Adaptive Bit Allocation Across Layers and Heads
+
+Once P1.1 has per-layer/per-head error measurements, allocate bits where they buy the most quality: deeper or fragile layers, sensitive heads, and outlier-heavy heads get more bits; easy layers/heads get fewer.
+
+The total bit budget stays fixed. The experiment is a rate-distortion scheduler over existing quantizers rather than a new quantizer.
+
+> **Relationship to P1.1:** P1.1 chooses MSE vs product mode. P1.6 generalizes that into a mixed-precision policy.
 
 ---
 
-## P2 — Solid Improvements, Moderate Implementation Effort
+## P2 — Strong Candidates, Moderate Effort
 
-These have strong theoretical backing and clear paths to implementation, but require more engineering or have slightly more uncertainty.
+These are worth testing after the reference path is stable. They either require additional math checks, calibration data, or systems work.
 
-### P2.1 — Dithered / Stochastic Quantization
+### P2.1 — Fused Quantized Attention CUDA Kernel
 
-Add controlled pseudo-random noise before rounding to break deterministic quantization artifacts. Dithering trades a small variance increase for eliminating systematic bias patterns that accumulate over many attention heads. This is standard in audio ADCs but unexplored in KV cache quantization.
+Do not materialize dequantized K/V tensors. Compute `softmax(QK^T)V` in a fused path that reads packed quantized codes, reconstructs centroid values in registers, and streams through attention.
 
-**Subtractive dithering** is the key variant: add noise before quantization, then subtract the same noise after dequantization. This recovers the variance cost — the only penalty is a small increase in quantization step size. For many-head attention (32–128 heads), the systematic bias from deterministic rounding compounds, while the variance from dithering averages out. The net effect should be positive for downstream quality.
+This is where memory compression becomes serving speed. The reference implementation should first prove quality; the fused kernel then proves deployability.
 
-> **Paper grounding:** TurboQuant Theorem 1 proves D_mse for the deterministic quantizer. With subtractive dithering, the expected MSE remains the same but the error becomes signal-independent (white noise), which is perceptually superior and less harmful to softmax operations.
+> **Prerequisite:** P0.2 should settle the rotation structure because the kernel needs to know whether it must apply dense rotation, FWHT, or pre-rotated-cache scoring.
 
-### P2.2 — Fused Quantized Attention CUDA Kernel
+### P2.2 — Fast Structured Residual QJL
 
-Don't materialize the dequantized matrix at all. Compute `softmax(Q·Kᵀ)V` in a single fused CUDA kernel that reads quantized codes, looks up centroids on-the-fly in registers, and streams through the computation. This eliminates the memory round-trip of the full dequantized KV cache — the same principle that makes AWQ/GPTQ fast for weight quantization. The quantized codes stay compressed in GPU memory until the moment they're needed in registers.
+TurboQuant_prod removes inner-product bias by applying QJL to the residual, but the residual sketch matrix is still dense in the paper algorithm. Test a structured residual sketch using SRHT/FWHT-style rows with random signs and optional row subsampling.
 
-> **Prerequisite:** P0.1 (Hadamard rotation) should be implemented first, since the fused kernel needs to know the transform structure. With Hadamard, the forward/inverse transforms are FFT-like butterfly operations that fuse naturally into the attention kernel.
+The first requirement is statistical: verify unbiasedness or quantify any bias under the structured replacement. The second is systems: determine whether residual sketching becomes cheap enough to use broadly.
 
-### P2.3 — Importance-Weighted Per-Coordinate Bit Allocation
+> **Paper grounding:** QJL's estimator depends on random projection rows and sign bits. Structured JL transforms are plausible replacements, but they need explicit bias/variance tests.
 
-P1.1 allocates bits per layer and head. Go finer: allocate bits per **coordinate** within the rotated space. After rotation, some coordinate directions contribute far more to attention score variance than others. Precompute per-coordinate sensitivity by measuring how perturbation along each rotated basis direction affects the softmax output, then allocate bits proportional to sensitivity.
+### P2.3 — Orthogonalized Residual Sketches
 
-This is a natural extension: after rotation, coordinates are near-independent, so the optimal bit allocation is separable — allocate more bits to high-variance coordinates. The sensitivity can be estimated offline from a calibration set (like P2.8) or derived analytically from the Beta distribution shape.
+QJL reports practical gains from orthogonalizing JL rows. Apply the same idea to TurboQuant's residual QJL stage and compare iid Gaussian rows, orthogonalized Gaussian rows, and structured orthogonal rows.
 
-> **Paper grounding:** TurboQuant Lemma 1 — coordinates follow Beta(d/2, (d-1)/2), which is symmetric around 0 but has variance ~1/d. All coordinates have equal variance asymptotically, but for finite d (64, 128) and real (non-spherical) inputs, the empirical variance per rotated coordinate will differ. Allocating bits proportionally to log-variance is the rate-distortion optimal strategy for independent Gaussian-like sources.
+This has no extra stored bits. It may reduce estimator variance, but the scaling and unbiasedness should be verified because orthogonalized rows are not literally iid Gaussian samples.
 
-### P2.4 — Orthogonalized Residual Sketches
+> **Paper grounding:** QJL Section 4.1 reports that orthogonalized random Gaussian matrices consistently improve practical performance.
 
-QJL explicitly reports empirical gains from orthogonalizing JL rows (QJL §4.1: "We observed that orthogonalized random Gaussian matrices consistently exhibit better practical performance... we first generate a random JL matrix S with i.i.d. Gaussian entries and then orthogonalize its rows using QR decomposition"). Apply this same idea specifically to TurboQuant's residual QJL stage.
+### P2.4 — Variable-Size Residual QJL
 
-The residual sketch matrix S in TurboQuant_prod is currently i.i.d. Gaussian. Replacing it with an orthogonalized version reduces estimator variance at zero additional memory cost — the sketch dimension and bit budget are unchanged.
+Make the residual sketch dimension `m` a tunable parameter instead of fixing `m = d`. Under a total budget
 
-> **Paper grounding:** QJL §4.1. TurboQuant Definition 1 (QJL) — the sketch matrix S is defined as i.i.d. N(0,1). The orthogonalized variant has the same unbiasedness guarantee (Lemma 4) but lower variance because the rows are decorrelated. This pairs naturally with P2.5 (variable-size residual).
+```text
+B = b_mse * d + m
+```
 
-### P2.5 — Variable-Size Residual QJL
+search for the best split between scalar MSE bits and residual sign bits.
 
-TurboQuant_prod currently spends exactly one additional bit per coordinate on the residual QJL stage. Generalize: let the residual sketch dimension `m` be a free parameter, then optimize the split `(b_mse, m)` under a fixed total bit budget. For easy layers or small residuals, `m < d` may preserve unbiasedness while saving memory. For fragile layers, `m > d` may outperform adding another scalar bit everywhere.
+For `m < d`, memory falls but residual estimator variance rises. For `m > d`, the residual stage may beat adding another scalar bit in fragile layers. The reference implementation should directly plot this tradeoff.
 
-The optimization problem: given total budget B = b_mse · d + m bits, find the split that minimizes D_prod from Theorem 2.
+> **Paper grounding:** TurboQuant Theorem 2 bounds product distortion through residual MSE and QJL variance. QJL's estimator is an average over projection rows, so changing row count naturally changes variance.
 
-> **Paper grounding:** TurboQuant Theorem 2 — D_prod ≤ √(3π)/2 · ‖y‖²/d · 1/4^{b_mse} · (something dependent on m/d). The current construction fixes m = d, but the bound suggests a tradeoff surface worth exploring.
+### P2.5 — Covariance- and Attention-Aware Offline Rotations
 
-### P2.6 — Learned Deterministic Rotations
+Replace the vague "learned deterministic rotation" idea with a concrete calibration method: estimate key covariance, value covariance, and attention-weighted error sensitivity offline, then derive fixed rotations and clipping thresholds per layer/head.
 
-Random rotation works for *any* input, but it's pessimistic — it treats your data as worst-case. In practice, LLM key embeddings within a given layer aren't worst-case; they have structure. Do a **cheap offline calibration** (a few forward passes on representative data) and learn a **deterministic per-layer rotation** that *maximally concentrates* coordinates into low-entropy distributions, so your scalar codebook becomes much better matched to the real data.
+This keeps serving-time cost predictable while allowing the transform to align with actual model statistics rather than worst-case spherical inputs.
 
-You stay data-oblivious at *serving time* (no per-token adaptation), but the rotation you use is no longer random — it's optimized. This could meaningfully close the 2.7× gap to Shannon's bound, especially at practical bit-widths like b=2–4.
+> **External grounding:** [OSCAR](https://arxiv.org/abs/2605.17757) estimates attention-aware covariance structures offline and uses them to derive deployable rotations and clipping thresholds for low-bit KV-cache quantization.
 
-> **Prerequisite:** P0.1 (Hadamard) should be done first as the baseline. P2.6 is then an enhancement: start with Hadamard + diagonal sign flip as the initialization, then optimize the diagonal signs via gradient descent to minimize distortion on calibration data. The resulting rotation is still O(d log d).
+### P2.6 — Importance-Weighted Coordinate Bit Allocation
+
+After rotation, coordinates are close to independent in the TurboQuant story, but they may not be equally important for real attention. Estimate per-coordinate sensitivity from calibration queries and allocate more bits to coordinates that drive logit or output error.
+
+This should be tested after P0.2/P1.4 because the optimal coordinate budget depends on the chosen rotation and channel permutation.
+
+> **Paper grounding:** TurboQuant's scalar quantization is separable after rotation. If real rotated coordinates have unequal empirical variance or sensitivity, separable mixed precision is the natural extension.
+
+### P2.7 — Clipped or Companded Lloyd-Max Codebooks
+
+Structured rotations and real KV tensors may have heavier tails than the exact Beta model. Test low-bit codebooks with calibrated clipping or companding before Lloyd-Max quantization.
+
+This is especially relevant for `b = 1` and `b = 2`, where a few tail coordinates can dominate error. The test should compare exact-Beta codebooks, empirical unclipped codebooks, clipped empirical codebooks, and log/µ-law style companding.
+
+> **Relationship to P0.3:** P0.3 is the clean theoretical codebook. P2.7 is the practical fallback when the measured distribution does not match the theoretical one.
 
 ---
 
 ## P3 — Worth Testing Later
 
-These are promising but more speculative, or require infrastructure from earlier tiers to be built first.
+These are promising but should not block the first implementation cycle.
 
 ### P3.1 — Distortion Metric Aligned with Token Prediction
 
-The current analysis minimizes MSE and inner product error. But what actually matters for LLMs is **KL divergence in the output token distribution**. Derive a quantization scheme that directly minimizes expected KL divergence between softmax outputs with and without quantization.
+Move beyond raw MSE and inner-product error by approximating the downstream objective: KL divergence between full-precision and quantized next-token distributions.
 
-Even a first-order Taylor expansion of the softmax yields a weighted inner-product distortion metric that's better aligned than raw MSE. The weights are query-dependent: coordinates that strongly influence high-attention tokens get higher weight. This could change which quantizer variant is optimal and how we evaluate success.
-
-> **Paper grounding:** TurboQuant §1.1 — the distortion measures D_mse and D_prod are proxies. The true objective is downstream task quality (§4.2–4.3). P3.1 makes the proxy more faithful to the objective, which may reveal that certain proposals (P1.2, P1.1) matter more than currently suspected.
+A first-order softmax expansion can yield an attention-weighted inner-product metric. This may change which quantizer looks best, especially for values and protected-token policies.
 
 ### P3.2 — Analytical Debiasing for TurboQuant MSE
 
-TurboQuant_mse is excellent for reconstruction, but its dequantized vectors are biased for inner product estimation at low bit-widths. Instead of always spending a full residual QJL stage, precompute a **codebook-specific scalar debiasing factor** (or a small per-bucket correction table) so that `⟨q, DeQuant_mse(k)⟩` is closer to unbiased.
+`TurboQuant_mse` is biased for inner-product estimation at low bit-width. Precompute codebook-specific scalar correction factors, or a small per-bucket correction table, to reduce bias during scoring without storing residual QJL bits.
 
-The 1-bit case already has a clean multiplicative bias; higher bit-widths should have measurable calibration curves from the Lloyd-Max centroids and Beta coordinate distribution. This changes only dequantization/scoring, not the encoded representation, making it cheap to test.
+This is attractive for latency-sensitive paths where `TurboQuant_prod` is too expensive. It should be judged by logit bias and downstream quality, not just synthetic inner-product bias.
 
-> **Note:** This is partially subsumed by P0.3 (layer-aware mixed mode) and the existence of TurboQuant_prod. The value here is mainly for applications where two-stage quantization is undesirable for latency reasons.
+### P3.3 — Query Batching Optimization for Fused Kernels
 
-### P3.3 — Age- and Role-Aware KV Precision
+When multiple queries hit the same KV cache, load quantized codes once and compute attention for several queries in one pass. This compounds the memory-bandwidth win from KV compression.
 
-Treat KV tokens differently based on their role in generation. Recent generated tokens, system/prefix tokens, delimiter tokens, and attention sinks often deserve higher precision than old bulk context tokens. This is a simple static serving policy that can be decided at cache write time and should be easy to combine with TurboQuant's streaming setup.
+This belongs after P2.1 because it is a kernel scheduling optimization, not a quantizer.
 
-> **Relationship to P1.1:** P1.1 allocates bits spatially (across layers/heads); P3.3 allocates temporally (across sequence positions). They compose naturally.
+### P3.4 — Lookup-Table Quantized Attention for Low Bit-Widths
 
-### P3.4 [NEW] — Residual QJL Coordinate Subsampling
+For `b <= 4`, precompute per-query contribution tables for each coordinate and centroid index. The attention score path becomes table lookup plus accumulation instead of multiply-heavy dequantization.
 
-Instead of applying QJL to all `d` coordinates of the residual, randomly subsample `m < d` coordinates and only store sign bits for those. The inner product estimator needs adjustment (importance sampling reweighting), but this directly reduces the residual stage memory by factor `d/m`.
+This should be treated as a subcase of P2.1. It is only useful if the table fits in fast memory and reduces real kernel time.
 
-This is a more aggressive version of P2.5. Where P2.5 treats `m` as a free parameter, P3.4 explicitly uses random subsampling, which has known variance properties from the importance sampling literature.
+### P3.5 — Block-Structured Hybrid Rotation
 
-> **Paper grounding:** TurboQuant Lemma 4 — the QJL estimator is an average of `d` i.i.d. samples zᵢ = √(π/2) · sᵢᵀy · sign(sᵢᵀx). Subsampling to `m` coordinates gives variance proportional to 1/m instead of 1/d. For residuals with small ‖x‖, the variance increase may be acceptable for the memory savings.
+If pure Hadamard/sign-flip rotations underperform dense Haar rotations, add a small dense mixing layer after the fast transform, for example 8x8 or 16x16 orthogonal blocks.
 
-### P3.5 [NEW] — Lookup-Table Quantized Attention (b=1,2)
+This preserves most of the `O(d log d)` benefit while adding local mixing capacity. It should only be tested after P0.2 proves where structured rotations fail.
 
-For b=1,2 bit quantization, all possible inner product contributions from quantized codes are enumerable. With b=1, there are only 2 centroids per coordinate; with b=2, there are 4. Precompute a lookup table mapping `(quantized_code_index, query_coordinate_value)` → contribution to inner product.
+### P3.6 — RoPE Placement and Grouped-Head Rotation Experiments
 
-At inference time, the attention computation becomes pure accumulation from the LUT — no floating-point multiplies. For b=1 with d=128, the LUT has only 128×2 = 256 entries per query, fitting comfortably in L1 cache. This would be absurdly fast and pairs naturally with P2.2 (fused kernel).
+Full RoPE-commuting rotations are still a hard mathematical problem, but narrower placement experiments are concrete enough to test: rotate before RoPE where possible, share/group rotations across heads, and measure whether RoPE reintroduces outliers after the transform.
 
-> **Limitation:** Only practical for b ≤ 2. For b=3 (8 centroids), the LUT grows to 128×8 = 1024 entries — still small. For b=4 (16 centroids), it's 2048 entries. Beyond that, direct multiply-accumulate is cheaper.
+> **External grounding:** [RotateKV](https://arxiv.org/abs/2501.16383)'s pre-RoPE grouped-head rotation is a practical signal that this can be evaluated experimentally without solving the full commuting-rotation problem.
 
-### P3.6 [NEW] — Block-Structured Hybrid Rotation (Hadamard + Small Dense Blocks)
+### P3.7 — ANN-Specific TurboQuant Scoring Path
 
-Use Hadamard for the O(d log d) bulk rotation, then apply **small** dense random rotations (e.g., 8×8 blocks) on top for residual mixing. Cost: O(d log d + d·8²) = O(d log d), still sub-quadratic.
+For nearest-neighbor search, score directly over TurboQuant codes and rerank only a small candidate set in full precision or higher precision.
 
-The Hadamard transform provides d/2 two-coordinate mixing operations. Adding small dense blocks gives within-group mixing that Hadamard's butterfly structure may miss. The result should achieve better decorrelation than pure Hadamard while staying much cheaper than full dense rotation.
-
-> **Relationship to P0.1:** P0.1 is the baseline. P3.6 is an enhancement if empirical decorrelation from pure Hadamard proves insufficient. The "HD³" construction in P0.1 (three rounds of Hadamard + sign flip) is already quite strong; this adds a final mixing layer.
-
-### P3.7 [NEW] — Online Adaptive Bit-Width via Streaming Variance Tracking
-
-P1.1 and P2.3 allocate bit budgets statically based on offline calibration. But the distribution of rotated coordinates may shift between prefill and decode phases, or across different prompts. Maintain an exponentially weighted moving average (EWMA) of per-coordinate variance during generation and reallocate bits on-the-fly.
-
-This is simple to implement: track a running variance estimate per rotated coordinate, periodically recompute the optimal bit allocation (which is just sorting by variance and assigning bits proportionally), and update the per-coordinate bit-width for the next block of tokens. No model changes needed.
-
-> **Advantage over static allocation:** Handles non-stationarity. If a particular prompt type or generation phase (e.g., chain-of-thought) produces different embedding statistics, the bit allocation adapts automatically.
-
-### P3.8 [NEW] — Norm-Baked Scalar Quantizer (Eliminate Norm Storage)
-
-Instead of normalizing vectors to the unit sphere (storing norms separately, as in P1.3), bake the norm into the quantization decision. For a vector with L2 norm `r`, the rotated coordinates are scaled by `r`: each coordinate follows a Beta distribution scaled to `[-r, r]`.
-
-Precompute Lloyd-Max codebooks for a grid of `r` values, then interpolate at runtime. The quantized representation stores only code indices — the norm is implicitly encoded in which codebook was used. This eliminates separate norm storage entirely.
-
-> **Tradeoff:** Requires per-vector codebook adaptation (cheap if precomputed and interpolated) and slightly larger codebook storage. The win is that every stored bit goes toward vector data. Pairs with P1.3 — if P3.8 works, P1.3 becomes unnecessary.
-
-### P3.9 [NEW] — Query Batching Optimization for Fused Kernels
-
-Extension of P2.2. In serving, multiple queries often hit the same KV cache simultaneously (batch inference). Structure the fused kernel to load quantized codes once from GPU memory, then compute attention for multiple queries in a single pass.
-
-This compounds the memory bandwidth savings from quantization: with batch size B, the effective bandwidth per query is divided by B. For b=2 quantization (4× compression) with batch size 8, the effective memory traffic per query is 32× lower than FP16 baseline.
-
-> **Prerequisite:** P2.2 (fused kernel). This is a batched generalization of the single-query fused attention kernel.
-
-### P3.10 [NEW] — Runtime Codebook Refinement via Streaming k-Means
-
-The theoretical Beta codebook (P0.2) is computed offline. At serving time, the actual rotated coordinate distribution may deviate slightly from the theoretical Beta due to finite dimensions, non-spherical inputs, or distribution shift. Run a lightweight streaming k-means (1–2 Lloyd iterations) on actual rotated coordinates to refine centroids.
-
-This stays online but uses runtime data. Unlike the rejected proposal (see Deferred), it does **not** add latency to the prefill phase — the refinement can happen asynchronously in background, updating centroids for future tokens.
-
-> **Paper grounding:** TurboQuant Algorithm 1 — the codebook is a global parameter computed once. This adds an optional online refinement step that converges toward the empirical distribution while staying within the same algorithmic framework.
-
-### P3.11 [NEW] — Quantized Rotation Matrix Storage
-
-The rotation matrix Π itself is d×d floating-point numbers. For d=128, that's ~65 KB per head. Across 32 layers × 32 heads, that's ~67 MB just for rotation matrices in FP32.
-
-Store Π in bfloat16 (halves the cost) or even int8 with per-column scale factors. The rotation only needs to approximately whiten coordinates — exact precision isn't critical. TurboQuant Theorem 1's bound depends on coordinates being Beta-distributed, which holds approximately even with quantized rotation entries.
-
-> **Note:** If P0.1 (Hadamard) is used, this becomes largely moot since structured transforms have near-zero storage (just the diagonal sign flip bits). This is mainly relevant if dense random rotations are kept for any reason.
-
-### P3.12 — ANN-Specific TurboQuant Scoring Path
-
-For nearest-neighbor search, implement asymmetric scoring directly over TurboQuant codes and rerank only a small candidate set in full precision or higher precision. The TurboQuant paper already shows strong recall and near-zero indexing time; the next systems win is avoiding full dequantization during search. This would make TurboQuant more compelling as a practical vector database primitive.
+TurboQuant already reports strong recall and near-zero indexing time. The next systems win is avoiding full dequantization during search.
 
 ---
 
 ## Deferred / Not Recommended
 
-These proposals were evaluated and found to be either invalid, premature, out of scope, or net-negative after deeper paper analysis. They are documented here with reasons to avoid revisiting them without new evidence.
+These ideas are either invalid as currently stated, redundant with stronger proposals, premature, or likely to lose to simpler baselines.
 
-### ❌ Joint (Vector) Quantization on Rotated Coordinates (was #4)
+### Joint Vector Quantization on Rotated Coordinates
 
-**Why not:** The random rotation's purpose is to make coordinates near-independent (TurboQuant §3.1: "distinct coordinates of Π·x become nearly independent"). If independence is achieved, joint quantization of pairs/triplets offers zero gain over scalar quantization. The 2.7× gap to Shannon's bound comes from scalar quantization on independent coordinates, not from residual correlation. For b=2, a scalar has 4 entries; 2D joint has 16. The codebook table grows exponentially (2^{b·group_size}) with no theoretical benefit when independence holds. **Revisit only if empirical evidence shows significant residual correlation after rotation.**
+The random rotation's purpose is to make coordinates nearly independent. If that works, joint quantization has little theoretical benefit and large codebook growth. Revisit only if P0.1 shows strong residual correlation after the chosen rotation.
 
-### ❌ Multi-Stage Residual Quantization (3–5 stages) (was #5)
+### Multi-Stage Residual Quantization
 
-**Why not:** The 2-stage design (MSE + QJL) is already elegant and provably near-optimal. Each successive residual has exponentially less energy. The audio codec analogy (CELP, Opus) doesn't transfer — those signals have strong harmonic structure in residuals, which rotated Gaussian-ish coordinates don't. Unless you can demonstrate exploitable structure in the post-QJL residual, adding stages is unjustified complexity. **Revisit only with evidence of structured residuals after stage 2.**
+The two-stage MSE + QJL design is already clean and near-optimal. Additional residual stages add complexity unless measured residual structure remains after QJL.
 
-### ❌ Frequency-Domain Transform (DCT/DST) (was #6)
+### DCT/DST Frequency-Domain Transform
 
-**Why not:** Covered by P0.1 (Hadamard). Hadamard has superior theoretical JL properties and GPU butterfly support. DCT/DST don't have the same guarantees for decorrelation. Unless there's strong empirical evidence that LLM embeddings are naturally sparse in DCT basis (unlikely given the learned nature of the embeddings), this adds complexity for no clear benefit. **Consolidated into P0.1/P3.6.**
+Hadamard-style transforms are the stronger baseline: cheaper, more common in quantization systems, and better connected to JL-style mixing. DCT/DST should not be a separate active branch without evidence.
 
-### ❌ Query-Conditional Adaptive Bit Width (was #9)
+### Entropy Coding or RLE on Quantized Indices
 
-**Why not:** Operationally impractical for autoregressive generation. A "coarse pass first, refine top-k" strategy requires two scans of the KV cache per generated token. The latency cost would dominate any memory savings. This is a viable idea for offline ANN search but not for real-time token generation. **Valid for ANN use case (see P3.12), invalid for KV cache serving.**
+TurboQuant itself estimates only modest entropy-coding savings, around 5% for one reported setting, and RLE is especially suspect because good rotations should make adjacent coordinates close to independent. Decode complexity and kernel friction likely outweigh the memory win. Revisit only after packed-code kernels exist.
 
-### ❌ Asymmetric Query/Key Transformations (was #10)
+### Dithered or Stochastic Quantization
 
-**Why not:** Underspecified. "Different but related projections" needs a concrete mathematical construction before it's evaluable. The QJL asymmetry (sign-bit on key, full projection on query) is already proven optimal for b=1 via Lemma 3.2. Generalizing to b>1 with different matrices is an open research problem, not an experiment candidate. **Defer until a concrete construction is proposed with theoretical guarantees.**
+Subtractive dithering is natural for uniform scalar quantizers, but TurboQuant uses Lloyd-Max centroid quantization. Adding dither introduces state and variance for unclear benefit. Keep it out of the active path until deterministic baselines are exhausted.
 
-### ❌ Cache-Line-Aware Code Layout (was #12)
+### Query-Conditional Adaptive Bit Width for Real-Time Generation
 
-**Why not:** Premature at the project's current stage. There is no CUDA kernel yet. Cache-line optimization is something you do after you have a working fused kernel (P2.2) and profiling data showing specific cache-miss bottlenecks. The algorithmic gains from P0.1 and P2.2 dwarf any layout tricks. **Defer until after P2.2 is implemented and profiled.**
+A coarse pass followed by selective refinement requires multiple scans of the KV cache per generated token. That is usually the wrong tradeoff for autoregressive serving. It may still be useful for offline ANN search.
 
-### ❌ Cross-Head / Cross-Layer Codebook Sharing (was #13)
+### Residual QJL Coordinate Subsampling
 
-**Why not:** Solving the wrong problem. The codebook is tiny: for b=2, it's 4 centroid values per coordinate. Even with 128 coordinates per head and 32 heads per layer, the total codebook is ~16 KB per layer. The memory is overwhelmingly in the index array (b·d·num_heads·num_tokens bits). Saving 16 KB is irrelevant when the KV cache for 128K tokens is gigabytes. **Remove.**
+As written, this duplicates P2.4. The clean formulation is variable-size QJL with `m` projection rows. Keep one proposal, not two.
 
-### ❌ Quantization-Aware Prefill Optimization (was #14)
+### Online Adaptive Bit-Width via EWMA
 
-**Why not:** Breaks TurboQuant's key advantage of being fully data-oblivious and online. Running k-means refinement during prefill adds latency to the most latency-sensitive phase of inference. For serving, prefill speed matters. The streaming variant (P3.10) is the correct way to incorporate runtime data without blocking the critical path. **Superseded by P3.10.**
+Changing bit-widths during generation complicates cache layout, packed kernels, and old-token compatibility. Static or block-static calibration should be tested first.
 
-### ❌ TurboQuant in Polar Space (was #15)
+### Runtime Codebook Refinement via Streaming k-Means
 
-**Why not:** The recursive polar transform adds O(d log d) computation that Hadamard (P0.1) already achieves with better theoretical backing. The distributions may be more concentrated (PolarQuant Lemma 2), but you lose the clean 2.7× optimality bound from TurboQuant Theorem 1. Without proving superiority over Hadamard-based TurboQuant, this is speculative hybridization. **Revisit only if empirical comparison shows polar angles yield lower distortion than Beta-coordinate scalar quantization at the same bit-width.**
+Multiple codebook versions inside one live KV cache create decode and metadata complexity, and online refinement weakens TurboQuant's data-oblivious advantage. Empirical codebooks from offline calibration are the cleaner test.
 
-### ❌ PolarQuant Angle Quantization of QJL Residual (was #16)
+### Norm-Baked Scalar Quantizer
 
-**Why not:** The residual after MSE quantization has small norm with no particular angular structure. The sign bit is information-theoretically optimal for 1-bit quantization (QJL Lemma 4). Converting to polar coordinates for a near-zero residual is unnecessary overhead. **Remove.**
+This does not really eliminate norm information unless the representation also stores or infers a norm bucket. In practice it turns side information into codebook-version metadata. P1.3 is simpler.
 
-### ❌ Block-Diagonal / Banded Rotation (was #17)
+### Quantized Dense Rotation Matrix Storage
 
-**Why not:** Directly contradicts the core insight of TurboQuant. The random rotation's job is to decorrelate all coordinates so scalar quantization works. Block-diagonal rotations preserve within-block correlations, which is exactly what you want to destroy. The result would be worse distortion for the same bit budget. **Remove.**
+If structured rotations win, dense matrix storage disappears. If dense rotations remain necessary, compute cost is the larger problem. This is not a high-leverage experiment.
 
-### ❌ End-to-End Differentiable Quantization / PTQ (was #18)
+### Asymmetric Query/Key Transformations Beyond QJL
 
-**Why not:** Requires model fine-tuning or retraining. This is a completely different category of work (model modification vs. algorithmic improvement). Out of scope for the current project phase, which focuses on quantization algorithm improvements that work with frozen models. **Out of scope.**
+QJL already gives a concrete asymmetric estimator. Generalizing to unrelated query/key transforms needs a mathematical construction before it is experimentally meaningful.
 
-### ❌ Learned Codebook from SVD of Weights (was #19)
+### Cache-Line-Aware Code Layout
 
-**Why not:** Needs significant implementation and model access. The SVD of weight matrices gives a rotation basis, but there's no guarantee it decorrelates key embeddings — the weight matrices transform hidden states to keys, not the keys themselves. Also breaks the data-oblivious property. **Out of scope for current phase. Partially addressed by P2.6 (learned rotations) which uses calibration data directly.**
+Premature before there is a fused quantized attention kernel and profiler data. Revisit after P2.1.
 
-### ❌ RoPE-Compatible Rotations (was #25)
+### Cross-Head or Cross-Layer Codebook Sharing
 
-**Why not:** Important for deployment but a hard open mathematical problem. Finding a preconditioner that commutes with RoPE's 2D rotation blocks is non-trivial. This is a research direction, not an experiment candidate. **Document as future work. Do not implement now.**
+The codebooks are tiny compared with the KV index arrays. This optimizes the wrong memory term.
 
-### ❌ Progressive Embedded Codebooks (was #26)
+### Quantization-Aware Prefill Clustering
 
-**Why not:** Operationally complex. The "append refinement bits" pattern requires a codebook family with strict nesting properties (harder to design than it sounds) and assumes you can revisit old tokens (not always true in streaming). The memory-pressure knob is appealing but the engineering cost is high. **Defer until a concrete nested codebook construction exists.**
+Running clustering during prefill hurts the most latency-sensitive phase. Offline calibration and fixed codebooks should be tested first.
+
+### TurboQuant in Polar Space
+
+This combines two coordinate systems without a clear advantage. PolarQuant is a valid baseline, but a hybrid should only return if experiments show polar angles beat Beta-coordinate scalar quantization at the same budget.
+
+### PolarQuant Angle Quantization of QJL Residual
+
+The residual is small and QJL sign bits are already designed for 1-bit inner-product correction. Polarizing the residual adds overhead without a clear statistical structure to exploit.
+
+### Block-Diagonal or Banded Rotation
+
+This weakens global mixing, which is the point of TurboQuant's rotation. The only acceptable block structure is P3.5, where a global fast rotation happens first.
+
+### End-to-End Differentiable Quantization / PTQ
+
+This changes the project category from frozen-model quantization algorithms to model adaptation. Keep out of scope for now.
+
+### Learned Codebook from SVD of Weights
+
+The SVD of projection weights does not necessarily decorrelate the resulting key/value activations. Calibration on actual KV tensors is the better route.
+
+### Full RoPE-Commuting Rotation Design
+
+A mathematically exact preconditioner that commutes with RoPE is still a deeper research problem. The active version is P3.6: test practical rotation placement and grouped-head variants.
+
+### Progressive Embedded Codebooks
+
+Nested refinement codebooks are operationally attractive but hard to design and awkward for streaming caches. Defer until a concrete nested Lloyd-Max construction exists.
 
 ---
 
-## Summary: Recommended Experiment Pipeline
+## Recommended Experiment Pipeline
 
-1. **Reference implementation** — Pure Python/PyTorch TurboQuant (MSE + Product) with dense random rotation (baseline)
-2. **P0.1** — Swap dense rotation for Hadamard + sign flip. Measure speedup and distortion delta.
-3. **P0.2** — Compute exact Beta(d) codebooks for d=64,128. Measure distortion improvement vs. Gaussian approximation.
-4. **P0.3** — Implement layer-aware mixed mode. Profile outlier presence per layer; apply MSE-only to shallow layers.
-5. **P1.1** — Add per-layer/per-head bit budget knobs on top of P0.3.
-6. **P1.2** — Split key/value quantization strategies.
-7. **P1.3** — Quantize norms in log space.
-8. **P1.4** — Add RLE entropy coding on index streams.
+1. **Reference implementation** — Implement TurboQuant MSE/product, QJL, exact-Beta codebooks, and deterministic tests.
+2. **P0.1/P0.2** — Validate dense Haar vs structured rotations before relying on Hadamard variants.
+3. **P0.3** — Compare exact finite-d codebooks against empirical codebooks under the selected rotation.
+4. **P0.4** — Add real KV-cache capture and report logit/output errors, not only vector MSE.
+5. **P1.1/P1.6** — Build mixed mode and mixed precision policies from measured layer/head errors.
+6. **P1.2** — Split key/value objectives and test key-favored budgets.
+7. **P1.3** — Quantize norm/radius/residual-norm side information.
+8. **P1.4/P1.5** — Add outlier-aware channel permutation and tiny high-precision protected-token pools.
+9. **P2.2/P2.4** — Tune residual QJL structure and sketch dimension.
+10. **P2.1** — Implement fused quantized attention only after the quantized representation stabilizes.
 
-After these eight steps, the core algorithmic improvements are in place. P2 items (CUDA kernel, dithering, orthogonalized residuals, learned rotations, variable-size QJL) then build on this foundation. P3 items are explored opportunistically as time and evidence permit.
+The goal of the first cycle is to reject weak assumptions quickly: if structured rotations do not match Haar quality, improve the rotation; if MSE bias matters even in shallow layers, use product/debiasing; if side information dominates the true memory ratio, compress metadata before building kernels.
