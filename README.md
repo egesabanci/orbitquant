@@ -35,6 +35,14 @@ The papers in this repository provide strong starting points:
 - **PolarQuant** shows that random preconditioning plus polar angle quantization can compress KV caches effectively.
 - **TurboQuant** combines random rotation, Lloyd-Max scalar quantization, and residual QJL to approach near-optimal distortion rates.
 
+The current proposal backlog also incorporates newer external signals:
+
+- **RotateKV** motivates outlier-aware channel reordering, pre-RoPE grouped-head rotation, and attention-sink protection.
+- **OSCAR** motivates offline attention-aware covariance rotations and calibrated clipping for ultra-low-bit KV cache storage.
+- **OCTOPUS** motivates small-block triplet quantization using octahedral direction codes plus Lloyd-Max norm codes.
+- **AQUA-KV** motivates predictive residual coding across layers, where quantization is applied to what previous-layer predictors cannot reconstruct.
+- **More for Keys, Less for Values** motivates key-favored bit budgets and finer key quantization granularity.
+
 OrbitQuant asks the next question:
 
 > Which further optimizations can make these methods faster, more accurate, easier to deploy, or better aligned with real LLM inference?
@@ -79,8 +87,8 @@ The proposal backlog is grouped around several optimization directions:
 | Adaptive precision | Spend bits where layers, heads, tokens, or coordinates need them most. |
 | Inner-product correction | Preserve attention logits and retrieval scores more faithfully. |
 | KV-cache systems work | Make compressed attention practical through layout and kernel design. |
-| Cross-paper hybrids | Combine TurboQuant, QJL, and PolarQuant ideas. |
-| Model-aware objectives | Optimize for token prediction quality rather than only MSE. |
+| Cross-paper hybrids | Combine TurboQuant, QJL, PolarQuant, OCTOPUS, OSCAR, and AQUA-style ideas. |
+| Model-aware objectives | Optimize for attention behavior and token quality rather than only MSE. |
 
 The proposals are not assumed to be correct. Each one needs implementation, measurement, and rejection or refinement based on evidence.
 
@@ -88,33 +96,36 @@ The proposals are not assumed to be correct. Each one needs implementation, meas
 
 The first proposals worth implementing are the ones with high expected payoff and relatively low implementation ambiguity:
 
-1. **Structured fast rotations**: test Hadamard/sign-flip transforms against dense random rotations.
-2. **Analytical debiasing for `TurboQuant_mse`**: reduce low-bit inner-product bias without always using residual QJL.
-3. **Variable-size residual QJL**: tune residual sketch dimension instead of fixing it to one bit per coordinate.
-4. **Exact finite-dimension codebooks**: build Lloyd-Max codebooks for practical head dimensions such as 64 and 128.
-5. **Quantized norm and radius storage**: reduce side-information overhead from norms, radii, and residual norms.
-6. **Separate key/value objectives**: optimize keys for logits and values for attention-weighted reconstruction.
-7. **Fused quantized attention path**: avoid materializing dequantized KV tensors during attention.
+1. **Measurement-first harness**: report MSE, logit bias, softmax KL, attention-output error, generated-token quality, latency, and true bytes/token.
+2. **Structured and attention-aware rotations**: compare Haar, Gaussian-QR, Hadamard/sign-flip, outlier-aware permutations, pre-RoPE grouped-head rotation, and OSCAR-style covariance rotations.
+3. **Exact and empirical Lloyd-Max codebooks**: build finite-d Beta codebooks for practical head dimensions and compare them with calibration-learned codebooks.
+4. **Analytical debiasing for `TurboQuant_mse`**: reduce low-bit inner-product bias without always using residual QJL.
+5. **Separate key/value objectives**: optimize keys for logits and values for attention-weighted reconstruction, with key-favored bit budgets.
+6. **OCTOPUS-style triplet codec**: test small-block octahedral direction-plus-norm quantization as a stronger non-scalar codec.
+7. **Variable-size residual QJL**: tune residual sketch dimension instead of fixing it to one bit per coordinate.
+8. **Quantized side information**: compress norms, radii, residual norms, clip scales, and codebook IDs.
+9. **Protected-token policies**: keep attention sinks, recent tokens, prefix/system tokens, and dynamically detected anomalous tokens at higher precision.
+10. **Fused quantized attention path**: avoid materializing dequantized KV tensors during attention.
 
 ## Planned Implementation Path
 
 ### Phase 1: Reference Implementations
 
 - Implement CPU/PyTorch reference versions of TurboQuant MSE, TurboQuant product, QJL, and selected proposal variants.
-- Add deterministic unit tests for codebooks, reconstruction error, estimator bias, and variance.
+- Add deterministic unit tests for codebooks, reconstruction error, estimator bias, QJL variance, and byte accounting.
 - Keep implementations simple enough to inspect and compare.
 
 ### Phase 2: Synthetic Evaluation
 
 - Test on controlled random vectors, sphere-distributed vectors, and embedding-like distributions.
-- Compare measured MSE and inner-product error against theoretical expectations.
+- Compare measured MSE, inner-product error, debiasing behavior, and residual-sketch variance against theoretical expectations.
 - Reject proposals that fail on simple controlled settings.
 
 ### Phase 3: KV Cache Integration
 
 - Add integration with a small decoder-only model.
 - Quantize keys and values during prefill and decode.
-- Measure attention-logit error, output hidden-state error, and generated-token quality.
+- Measure attention-logit bias/error, softmax KL drift, attention-output error, hidden-state error, generated-token quality, and true memory ratio including side information.
 
 ### Phase 4: Long-Context Benchmarks
 
@@ -134,6 +145,7 @@ A proposal is considered promising only if it improves at least one of the follo
 
 - Lower reconstruction error at the same bit budget.
 - Lower inner-product error or bias at the same bit budget.
+- Lower attention-score KL drift or attention-output error at the same memory ratio.
 - Better long-context task quality at the same memory ratio.
 - Lower runtime overhead during prefill or decode.
 - Lower side-information overhead.
