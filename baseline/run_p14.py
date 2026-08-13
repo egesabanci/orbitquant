@@ -4,12 +4,12 @@ Compares three channel orderings applied before a Hadamard+sign-flip rotation
 (``rot.hadamard_sign_flip``, rounds=1 -> "hd") on the rotation checks
 (beta_ks, rms_corr, mse):
 
-- no-perm:      identity channel order (outlier channels stay clustered);
-- random-perm:  a fresh random permutation per trial;
-- outlier-perm: the P1.4 permutation from calibration on synthetic vectors
-                with a few outlier channels, fixed after calibration,
-                spreading the top outlier channels one per FWHT butterfly
-                group.
+- no-perm:          identity channel order (outlier channels stay clustered);
+- random-perm:      a fresh random permutation per trial;
+- outlier-aware-perm: the P1.4 permutation from calibration on synthetic
+                    vectors with a few outlier channels, fixed after
+                    calibration, spreading the top outlier channels one per
+                    FWHT butterfly group.
 
 All rotations are ``Rotation`` objects (forward/inverse). Fixed adversarial
 x, averaged over independent rotations per trial. The primary fixed x is a
@@ -130,7 +130,7 @@ def main(argv=None) -> int:
     print(f"  calibration: n_cal={args.n_cal} outlier channels={channels.tolist()} "
           f"gain={args.gain:g}")
     print(f"  detected outliers (by score): {detected.tolist()}")
-    print(f"  aware perm (channel->position): {aware_perm.tolist()}")
+    print(f"  aware perm (position->channel): {aware_perm.tolist()}")
     print(f"  orthogonality self-check: max ||R x||/||x|| dev={max_norm_dev:.2e}, "
           f"max ||R^-1 R x - x||={max_inv_err:.2e}")
 
@@ -142,7 +142,7 @@ def main(argv=None) -> int:
         ("no-perm", lambda: permuted_hadamard_rotation(d, rng)),
         ("random-perm",
          lambda: permuted_hadamard_rotation(d, rng, perm=rng.permutation(d))),
-        ("outlier-perm",
+        ("outlier-aware-perm",
          lambda: permuted_hadamard_rotation(d, rng, perm=aware_perm)),
     ]
 
@@ -151,14 +151,14 @@ def main(argv=None) -> int:
         ("x=e1 (degenerate for permutations)", x_e1),
     ):
         print(f"\nfixed {xlabel}")
-        print(f"{'rotation':<14}{'beta_ks':>9}{'rms_corr':>10}{'mse':>9}{'rt_s':>7}")
-        print("-" * 52)
+        print(f"{'rotation':<18}{'beta_ks':>9}{'rms_corr':>10}{'mse':>9}{'rt_s':>7}")
+        print("-" * 53)
         for label, factory in variants:
             r = eval_variant(label, d, n_rot, rng, x, cbk, factory)
-            print(f"{r['rotation']:<14}{r['beta_ks']:>9.4f}{r['rms_corr']:>10.4f}"
+            print(f"{r['rotation']:<18}{r['beta_ks']:>9.4f}{r['rms_corr']:>10.4f}"
                   f"{r['mse']:>9.4f}{r['runtime_s']:>7.3f}")
 
-    print("-" * 52)
+    print("-" * 53)
     print(f"Reference (Haar, d=64, b={b}): beta_ks~0.002, rms_corr~0.02, "
           "mse~0.36 (any fixed unit x)")
     return 0

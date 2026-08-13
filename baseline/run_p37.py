@@ -62,10 +62,10 @@ def main(argv=None) -> int:
     t0 = time.perf_counter()
     for i in range(nrot):
         R = rot.rotation_from_name("haar", d, rng)
+        trial = ann.ann_recall_trial(X, Q, R, codebook, ks, args.cand_scale)
         for k in ks:
-            rf, rr = ann.ann_recall_trial(X, Q, R, codebook, k, args.cand_scale)
-            acc[k]["full"] += rf
-            acc[k]["rerank"] += rr
+            acc[k]["full"] += trial[k][0]
+            acc[k]["rerank"] += trial[k][1]
     elapsed = time.perf_counter() - t0
     for k in ks:
         acc[k]["full"] /= nrot

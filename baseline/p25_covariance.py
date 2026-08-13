@@ -1,27 +1,42 @@
 """P2.5 -- Covariance-aware rotations.
 
-A rotation derived from an empirical covariance target
+A *fixed* rotation calibrated offline from an empirical covariance target
+(proposals.md P2.5: "derive fixed rotations ... offline"). Two forward
+conventions are implemented and benchmarked, both with the same ingredients
+-- eigenbasis U (``eigh`` column convention: z = U^T x are the
+eigen-coordinates whose variances are the eigenvalues), balancing
+permutation P (interleaves high- and low-variance eigen-coordinates so
+every FWHT butterfly pair mixes one large and one small eigenvalue),
+frozen sign flip D1, normalized Hadamard H (FWHT butterfly):
 
-    T = D2 U H D1 P
+    covUHP  T = U H D1 P U^T    the proposal's "U*H*P" product structure:
+                                decorrelate into eigen-coordinates (U^T),
+                                balance (P), mix (H), map back (U). The
+                                literal U-H-P composition acts on
+                                eigen-coordinates, so P's high/low
+                                balancing is real. The final U re-enters
+                                the data basis and mixes H's off-diagonal
+                                covariance into the diagonal (measured).
+    covHP   T = H D1 P U^T      transpose/order convention: decorrelate,
+                                balance, mix, and stay in the mixed basis
+                                (no final U). The transformed-covariance
+                                diagonal is then exactly trace(Cov(x))/d:
+                                    diag(T Cov(x) T^T)
+                                      = diag(H P U^T Cov(x) U P^T H)
+                                      = (1/d) sum_i (U^T Cov(x) U)_ii
+                                        + (1/d) sum_{i!=j} +- (U^T Cov(x) U)_ij
+                                i.e. guaranteed balanced up to the small
+                                eigen-estimation residual of U^T Cov(x) U.
 
-where U is the eigenbasis of a covariance matrix (columns sorted by
-descending eigenvalue), H is the normalized Hadamard transform (FWHT
-butterfly), and P is a *balancing permutation* that interleaves
-high-variance and low-variance coordinates so that every FWHT butterfly
-pair mixes one large and one small eigenvalue. D1, D2 are random sign
-flips and P is re-shuffled within the two variance bands per trial, so
-the rotation is a randomized family (like the randomized Hadamard).
-
-For signals whose covariance matches the calibration target, T
-decorrelates the coordinates (U) and balances their energy (H, P): the
-rotated coordinates are approximately isotropic with variance
-trace(Sigma)/d, which keeps scalar quantization errors balanced. Unlike
-Haar, the transform is *adaptive*: it is not a universal mixer, so the
-standard Beta-coordinate checks on an adversarial fixed vector degrade.
+U, P and D1 are drawn once from calibration and frozen; the returned
+``Rotation`` is the deployed transform, evaluated on fresh data (fixed
+offline rotation). Both conventions are reported in the runner, with the
+order/transpose convention explained above.
 
 The covariance is *empirical*: it is estimated from n_cal synthetic
 calibration samples of a generative model with k_out large-magnitude
-outlier channels (eigenvalue ratio out_ratio).
+outlier channels whose eigenvalues decrease geometrically (largest =
+out_ratio, halving per channel), so the eigenbasis is well determined.
 
 All rotations are ``Rotation`` objects (forward/inverse). Pure NumPy;
 no SciPy, no model, no GPU.
@@ -37,7 +52,7 @@ __all__ = [
     "synthetic_covariance_data",
     "empirical_eigenbasis",
     "balancing_permutation",
-    "covariance_rotation",
+    "calibrate_covariance_rotation",
     "top_k_variance_fraction",
 ]
 
@@ -53,7 +68,8 @@ def synthetic_covariance_data(
 
     Generative model: rows X = (L^{1/2} Z) Q^T with Z ~ N(0, I_{n_cal x d}),
     Q a fixed random orthogonal 'channel' basis, and L diagonal with the
-    first k_out eigenvalues equal to out_ratio and the rest 1. Returns
+    first k_out eigenvalues equal to out_ratio * 0.5^j (geometrically
+    decreasing, well separated) and the rest 1. Returns
 
         (X, Sigma, Q, lam)
 
@@ -63,7 +79,7 @@ def synthetic_covariance_data(
     """
     Q = random_rotation(d, rng)
     lam = np.ones(d)
-    lam[:k_out] = out_ratio
+    lam[:k_out] = out_ratio * (0.5 ** np.arange(k_out))
     Z = rng.standard_normal((n_cal, d))
     X = (Z * np.sqrt(lam)) @ Q.T
     Sigma = X.T @ X / n_cal
@@ -100,47 +116,78 @@ def balancing_permutation(
     return pi
 
 
-def covariance_rotation(
+def calibrate_covariance_rotation(
     eigenvalues: np.ndarray,
     U: np.ndarray,
     rng: np.random.Generator,
+    convention: str = "hp",
 ) -> rot.Rotation:
-    """One randomized covariance-aware rotation T = D2 U H D1 P.
+    """Calibrate ONE fixed covariance-aware rotation (offline).
 
-    Eigenbasis U (columns sorted by descending eigenvalue), Hadamard H via
-    the FWHT butterfly, balancing permutation P, and fresh random sign flips
-    D1, D2 plus a fresh balancing permutation per call, so repeated calls
-    give the randomized rotation family used for the benchmark.
+    Called once after estimating the empirical covariance; the balancing
+    permutation P and the sign flip D1 are drawn from ``rng`` exactly once
+    and frozen, so the returned ``Rotation`` is a fixed object -- the
+    deployed transform for all subsequent evaluation (P2.5 "fixed offline
+    rotations"). Call again only to re-calibrate from new data.
 
-    O(d^2) forward/inverse (the eigenbasis U is dense; it is the learned
-    object). Requires d a power of two for the FWHT.
+    ``convention`` selects the forward order (see the module docstring):
+
+    - "hp"  (default): T = H D1 P U^T. Decorrelate (U^T), balance (P),
+      mix (H); no final U, so diag(T Cov(x) T^T) = trace(Cov(x))/d exactly
+      up to the eigen-estimation residual -- guaranteed balanced rotated
+      coordinates.
+    - "uhp": T = U H D1 P U^T. The proposal's literal "U*H*P" product
+      structure: decorrelate, balance, mix, then map back through U. The
+      final U re-enters the data basis; H's off-diagonal covariance then
+      leaks into the diagonal (measured in the runner's balance check).
+
+    O(d^2) forward/inverse (U is dense; it is the learned object). Requires
+    d a power of two for the FWHT.
     """
     d = U.shape[0]
     if d & (d - 1):
         raise ValueError(f"d={d} must be a power of two for the FWHT")
+    if convention not in ("hp", "uhp"):
+        raise ValueError(f"unknown convention '{convention}'; have hp, uhp")
     pi = balancing_permutation(eigenvalues, rng)
     inv_pi = np.argsort(pi)
     s1 = rng.choice([-1.0, 1.0], size=d)
-    s2 = rng.choice([-1.0, 1.0], size=d)
 
     def _h(x: np.ndarray) -> np.ndarray:
         return rot.fwht(x) / np.sqrt(d)
 
-    def forward(x):
-        y = x[pi]              # P  (balancing permutation)
-        y = s1 * y             # D1 (random signs)
-        y = _h(y)              # H  (normalized Hadamard)
-        y = U @ y              # U  (empirical eigenbasis)
-        return s2 * y          # D2 (random signs)
+    if convention == "hp":
+        def forward(x):
+            z = U.T @ x          # U^T: decorrelate into eigen-coordinates
+            z = z[pi]            # P:   balancing permutation (eigen-coords)
+            z = s1 * z           # D1:  frozen sign flips
+            return _h(z)         # H:   normalized Hadamard mix
 
-    def inverse(x):
-        y = s2 * x             # D2 (symmetric)
-        y = U.T @ y            # U^T
-        y = _h(y)              # H^T = H
-        y = s1 * y             # D1
-        return y[inv_pi]       # P^T
+        def inverse(x):
+            h = _h(x)            # H^T = H
+            h = s1 * h           # D1
+            h = h[inv_pi]        # P^T
+            return U @ h         # U:   back to data coordinates
 
-    return rot.Rotation(forward, inverse, "covUHP")
+        name = "covHP"
+    else:  # "uhp"
+        def forward(x):
+            z = U.T @ x          # U^T: decorrelate into eigen-coordinates
+            z = z[pi]            # P:   balancing permutation (eigen-coords)
+            z = s1 * z           # D1:  frozen sign flips
+            h = _h(z)            # H:   normalized Hadamard mix
+            return U @ h         # U:   map back to the data basis
+
+        def inverse(x):
+            y = U.T @ x          # U^T
+            z = _h(y)            # H^T = H
+            z = s1 * z           # D1
+            z = z[inv_pi]        # P^T
+            return U @ z         # U:   back to data coordinates
+
+        name = "covUHP"
+
+    return rot.Rotation(forward, inverse, name)
 
 
 def top_k_variance_fraction(eigenvalues: np.ndarray, k: int) -> float:

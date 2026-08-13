@@ -83,8 +83,8 @@ def outlier_aware_permutation(
 ) -> np.ndarray:
     """Permutation spreading the top-n_out channels across FWHT butterfly groups.
 
-    Returns ``perm`` with ``perm[i]`` = output position of channel ``i``
-    (``x[perm]`` moves channel ``i`` to position ``perm[i]``). The top
+    Returns ``perm`` with ``perm[p]`` = source channel placed at output
+    position ``p`` (``x[perm]`` builds the permuted vector directly). The top
     ``n_out`` channels by ``scores`` (highest magnitude) are placed at the
     bit-reversed positions ``br(0..n_out-1)``; the rest fill the remaining
     positions in decreasing score order.
@@ -102,14 +102,16 @@ def outlier_aware_permutation(
     m = int(np.log2(d))
     k = min(int(np.ceil(np.log2(n_out))), m)
     block = d >> k  # butterfly group size with at most one outlier
+    s = m - k  # log2(block); offset lives inside the block
     order = np.argsort(-np.asarray(scores, dtype=np.float64), kind="stable")
     pos = np.full(d, -1, dtype=np.int64)
     for i in range(n_out):
         blk = i & ((1 << k) - 1)
-        pos[blk * block + _bit_reverse(blk, k)] = int(order[i])
+        off = _bit_reverse(blk & (block - 1), s)
+        pos[blk * block + off] = int(order[i])
     fill = np.nonzero(pos < 0)[0]
     pos[fill] = order[n_out:]  # remaining channels, decreasing score
-    return np.argsort(pos)
+    return pos
 
 
 def outlier_vector(
@@ -139,8 +141,9 @@ def permuted_hadamard_rotation(
     """Hadamard+sign-flip rotation with an optional pre-permutation.
 
     T = (D_k H ... D_1 H) P: the FWHT sign-flip rotation of ``rotations``
-    applied after permuting channels by ``perm`` (``perm[i]`` = output
-    position of channel ``i``). With ``perm=None`` this is exactly
+    applied after permuting channels by ``perm`` (``perm[p]`` = source
+    channel at output position ``p``, so ``x[perm]`` is the permuted vector;
+    inverse applies ``y[argsort(perm)]``). With ``perm=None`` this is exactly
     ``rot.hadamard_sign_flip`` (no permutation). Returns a ``Rotation``
     object with forward/inverse.
     """

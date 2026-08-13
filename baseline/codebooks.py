@@ -139,13 +139,16 @@ def _lloyd_max_symmetric(
     return c
 
 
-def beta_lloyd_max(d: int, b: int, grid: int = 100_001) -> np.ndarray:
+def beta_lloyd_max(d: int, b: int, grid: int = 100_001, max_iter: int = 500) -> np.ndarray:
     """Exact finite-d Beta Lloyd-Max codebook for bit-width b.
 
     Returns 2**b centroids, symmetric about zero, sorted ascending.
+    ``max_iter`` is passed through to the Lloyd-Max fixed-point solver
+    (default 500; larger values help wide codebooks, e.g. b >= 5).
     """
     n_pos = 2 ** (b - 1)  # positive-side centroids
-    pos = _lloyd_max_symmetric(lambda x: beta_pdf(x, d), n_pos, grid=grid)
+    pos = _lloyd_max_symmetric(lambda x: beta_pdf(x, d), n_pos, grid=grid,
+                               max_iter=max_iter)
     neg = -pos
     return np.concatenate([neg[::-1], pos])
 

@@ -61,7 +61,10 @@ def main(argv=None) -> int:
         print(f"error: budget {budget} exceeds bmax*d = {args.bmax}*{d}")
         return 2
 
-    codebooks = {b: cb.beta_lloyd_max(d, b) for b in range(1, args.bmax + 1)}
+    # max_iter=4000: wide codebooks (b >= 5, k >= 16) need more Lloyd-Max
+    # iterations than the codebooks.py default of 500.
+    codebooks = {b: cb.beta_lloyd_max(d, b, max_iter=4000)
+                 for b in range(1, args.bmax + 1)}
     S = d * int(np.ceil(np.log2(args.bmax + 1)))  # signaling cost of the pattern
 
     print(f"P2.6 importance-weighted bit allocation  d={d} nrot={n_rot} "
