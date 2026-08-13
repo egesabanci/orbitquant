@@ -46,7 +46,7 @@ def main(argv=None) -> int:
     ks = sorted(args.ks)
 
     X, Q = ann.ann_dataset(args.n_db, args.n_q, d, rng)
-    true = Q @ X.T
+    true = Q @ X.T                       # cached ground truth (rotation-invariant)
     codebook = cb.beta_lloyd_max(d, args.b)
     n_bits = args.n_db * d * args.b  # stored code size
 
@@ -62,7 +62,7 @@ def main(argv=None) -> int:
     t0 = time.perf_counter()
     for i in range(nrot):
         R = rot.rotation_from_name("haar", d, rng)
-        trial = ann.ann_recall_trial(X, Q, R, codebook, ks, args.cand_scale)
+        trial = ann.ann_recall_trial(X, Q, R, codebook, ks, args.cand_scale, true)
         for k in ks:
             acc[k]["full"] += trial[k][0]
             acc[k]["rerank"] += trial[k][1]

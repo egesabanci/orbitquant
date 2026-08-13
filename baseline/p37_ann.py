@@ -196,17 +196,20 @@ def ann_recall_trial(
     codebook: np.ndarray,
     ks: list,
     cand_scale: int,
+    true: np.ndarray,
 ) -> dict:
     """One-trial recall@k for all k: {k: (full_dequant, score + rerank)}.
 
     Encodes the corpus once, then scores it both ways -- ADC code scan
     (P3.7 path) and corpus-wide dequantization (baseline) -- and returns the
-    two pipelines' recall per k.
+    two pipelines' recall per k. ``true`` is the cached exact (n_q, n_db)
+    ground-truth inner-product matrix, computed once outside the trial loop;
+    inside the trial the full-precision database ``X`` is touched only for
+    the C rerank candidates (via ``recall_pipelines``).
     """
-    true = Q @ X.T                                # (n_q, n_db) exact inner products
     codes = product_codes(X, R, codebook)
-    S_scan = quantized_scores_scan(Q, codes, codebook, R)  # P3.7: scan over codes
-    S_full = full_dequant_scores(Q, codes, codebook, R)    # baseline: dequantize all
+    S_scan = quantized_scores_scan(Q, codes, codebook, R)   # P3.7: scan over codes
+    S_full = full_dequant_scores(Q, codes, codebook, R)     # baseline: dequantize all
     return {
         k: recall_pipelines(Q, X, S_full, S_scan, true, k, cand_scale)
         for k in ks
