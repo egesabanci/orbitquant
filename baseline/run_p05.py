@@ -39,16 +39,20 @@ def main(argv=None) -> int:
               f"{a['true_bits_per_coord_equiv']:>8.3f}")
     print()
 
-    print("Deployability scores (1.0 = fully deployable):")
-    print(f"{'representation':<34}{'score':>6}   paged reg fused batch no_dequant")
+    print("Deployability (structural=verified from codec, fused/dequant=ASSUMED")
+    print("until P2.1 GPU kernels are run):")
+    print(f"{'representation':<34}{'verif':>6}{'inclAsm':>8}   paged reg fused batch no_dequant")
     for r in rows:
         dep = r["dep"]
-        p = dep["properties"]
-        flags = "".join("Y" if v else "." for v in
-                        [p["paged_cache_fit"], p["register_dequant"],
-                         p["fused_attention"], p["query_batching"],
-                         p["no_dequant_materialize"]])
-        print(f"{r['rep'].name:<34}{dep['score']:>6.2f}   {flags}")
+        s = dep["structural"]
+        a = dep["assumed_gpu"]
+        flags = "".join(
+            ("?" if v else ".") if k in a else ("Y" if v else ".")
+            for k, v in {**s, **a}.items()
+        )
+        print(f"{r['rep'].name:<34}{dep['verified_score']:>6.2f}"
+              f"{dep['score_incl_assumed']:>8.2f}   {flags}")
+    print("  '?' = assumed (GPU kernel not run); Y = verified structural")
     print()
 
     # headline comparison: nominal vs true at the same nominal bits

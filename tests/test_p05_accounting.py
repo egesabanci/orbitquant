@@ -48,10 +48,19 @@ def test_predictor_amortizes_with_cache_length():
 
 
 def test_deployability_score():
-    """Fully-deployable reps score 1.0; per-block baseline scores lower."""
+    """Fully-deployable reps verify 1.0 structural; per-block baseline lower."""
     good = p05.Representation(name="good", payload_bits_per_coord=2)
     bad = p05.Representation(name="bad", payload_bits_per_coord=2,
                              register_dequant=False, fused_attention=False,
                              no_dequant_materialize=False)
-    assert p05.deployability(good)["score"] == 1.0
-    assert p05.deployability(bad)["score"] == pytest.approx(2 / 5)
+    dg = p05.deployability(good)
+    db = p05.deployability(bad)
+    # structural properties verified from the codec: paged_cache_fit and
+    # query_batching are True; register_dequant is False for `bad`
+    assert dg["verified_score"] == 1.0
+    assert db["verified_score"] == pytest.approx(2 / 3)
+    # GPU-dependent properties are marked assumed, not verified
+    assert set(dg["assumed_gpu"]) == {"fused_attention", "no_dequant_materialize"}
+    assert all(dg["assumed_gpu"].values())  # structurally plausible, but assumed
+    assert dg["score_incl_assumed"] == 1.0
+    assert db["score_incl_assumed"] == pytest.approx(2 / 5)  # 2 structural of 5

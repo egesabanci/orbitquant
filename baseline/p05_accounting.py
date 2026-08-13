@@ -50,12 +50,14 @@ class Representation:
     pack_bits_per_block: int = 0
     block_size: int = 64
     zero_point_scale: tuple[int, int] = (0, 0)  # (zp_bits, scale_bits) per block
-    # deployability properties
-    paged_cache_fit: bool = True
-    register_dequant: bool = True
-    fused_attention: bool = True
-    query_batching: bool = True
-    no_dequant_materialize: bool = True
+    # deployability properties. GPU-kernel-dependent properties (fused
+    # attention, no-dequant materialization) are ASSUMPTIONS from the codec
+    # structure, NOT verified -- P2.1 kernels were deferred to the GPU box.
+    paged_cache_fit: bool = True          # structural: fixed per-token size
+    register_dequant: bool = True         # structural: no per-block constants
+    fused_attention: bool = True          # ASSUMED (needs P2.1 kernel, GPU)
+    query_batching: bool = True           # structural: query-agnostic codes
+    no_dequant_materialize: bool = True   # ASSUMED (needs P2.1 kernel, GPU)
     notes: str = ""
 
 
@@ -107,15 +109,30 @@ def accounting(rep: Representation, d: int, n_tokens: int) -> dict:
 
 
 def deployability(rep: Representation) -> dict:
-    """Deployability score: fraction of the five properties that hold."""
-    props = {
+    """Deployability: structural (verified from the codec) vs assumed (GPU).
+
+    Structural properties -- paged_cache_fit, register_dequant, query_batching
+    -- follow from the representation's structure and are verified here.
+    GPU-kernel-dependent properties -- fused_attention,
+    no_dequant_materialize -- require the P2.1 fused kernel (deferred to the
+    GPU box) and are reported as ASSUMPTIONS, not verified.
+    """
+    structural = {
         "paged_cache_fit": rep.paged_cache_fit,
         "register_dequant": rep.register_dequant,
-        "fused_attention": rep.fused_attention,
         "query_batching": rep.query_batching,
+    }
+    assumed = {
+        "fused_attention": rep.fused_attention,
         "no_dequant_materialize": rep.no_dequant_materialize,
     }
-    return {"properties": props, "score": sum(props.values()) / len(props)}
+    n_verified = sum(structural.values())
+    return {
+        "structural": structural,
+        "assumed_gpu": assumed,
+        "verified_score": n_verified / len(structural),
+        "score_incl_assumed": (n_verified + sum(assumed.values())) / 5,
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -187,8 +204,8 @@ def default_representations(d: int = 64, n_tokens: int = 8192) -> list[Represent
             zero_point_scale=zp_scale,
             block_size=block,
             register_dequant=False,  # per-block scale in memory, not registers
-            fused_attention=False,  # needs dequant before attention
-            no_dequant_materialize=False,
+            fused_attention=False,  # needs dequant before attention (assumed)
+            no_dequant_materialize=False,  # materializes dequantized (assumed)
             notes="per-128-coord block: 8-bit zp + 8-bit scale",
         ),
     ]
