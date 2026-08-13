@@ -4,12 +4,12 @@ The TurboQuant-style product estimator stores, per database vector, a b-bit
 code per coordinate: rotate with a shared orthogonal rotation, then scalar
 quantize each rotated coordinate with the exact-Beta Lloyd-Max codebook.
 Queries are then scored **directly over the stored codes** in ADC
-(asymmetric-distance-computation) style: the code array is scanned blockwise,
-each block's code indices resolved through the codebook lookup table, and the
-block scores computed as inner products of the rotated query with those
-block reconstructions. Only one block of reconstructions is ever in flight --
-no full-precision database vectors are touched and no dequantized corpus is
-materialized.
+(asymmetric-distance-computation) style: a per-query, per-coordinate
+contribution lookup table  LUT[q, c, m] = (R q)[c] * centroid[m]  is built,
+and each database vector's score is the sum of LUT entries picked by its code
+indices -- a gather-add over the code array with no code reconstruction, no
+full-precision database vectors touched, and no dequantized corpus
+materialized (the scan is blockwise to bound working memory).
 
 Two retrieval pipelines are compared on a synthetic unit-vector dataset
 (``n_db`` database vectors, ``n_q`` queries, iid uniform on the sphere):
@@ -90,29 +90,32 @@ def quantized_scores_scan(
     R: rot.Rotation,
     db_block: int = 1000,
 ) -> np.ndarray:
-    """ADC-style scoring of queries over stored codes (blockwise code scan).
+    """ADC-style scoring of queries directly over stored codes (pure LUT).
 
-    Scans the stored code array in database blocks: for each block, the code
-    indices are resolved through the codebook lookup table (centroid gather
-    for that block only) and the block scores are the inner products of the
-    rotated queries with those reconstructions:
+    Builds the per-query, per-coordinate contribution lookup table
+    ``lut[q, c, m] = (R q)[c] * centroid[m]`` and scores each database vector
+    by summing the LUT entries picked by its code indices:
 
-        score(q, j) = <R q, D(codes[j])>,   D = codebook[.]
+        score(q, j) = sum_c lut[q, c, codes[j, c]]
 
-    Only one block of reconstructions (``db_block`` rows) is ever in flight,
-    so no dequantized corpus is materialized and no full-precision database
-    vector is touched -- unlike the ``full_dequant_scores`` baseline, which
-    dequantizes the entire corpus in one shot.
+    The code array is scanned blockwise over the database and the gather uses
+    ``take_along_axis`` on the LUT along the codebook axis -- the codebook is
+    consulted only through the LUT, so no database code is ever reconstructed
+    (no ``codebook[codes]`` anywhere on this path) and no full-precision
+    database vector is touched.
 
     Returns the (n_q, n_db) approximate score matrix.
     """
     Qr = _rotate_batch(R, Q)                      # (n_q, d) rotated queries
-    n_q, n_db = Q.shape[0], codes.shape[0]
+    n_q, d = Qr.shape
+    n_db = codes.shape[0]
+    lut = Qr[:, :, None] * codebook[None, None, :]  # (n_q, d, n_c)
     S = np.empty((n_q, n_db))
     for lo in range(0, n_db, db_block):
         codes_b = codes[lo : lo + db_block]       # (B, d) int code indices
-        D_b = codebook[codes_b]                   # (B, d) block reconstructions
-        S[:, lo : lo + D_b.shape[0]] = Qr @ D_b.T
+        B = codes_b.shape[0]
+        idx = np.broadcast_to(codes_b.T[None], (n_q, d, B))  # [q, c, j] = codes[j, c]
+        S[:, lo : lo + B] = np.take_along_axis(lut, idx, axis=2).sum(axis=1)
     return S
 
 
@@ -159,6 +162,7 @@ def recall_pipelines(
     true: np.ndarray,
     k: int,
     cand_scale: int,
+    presorted: tuple | None = None,
 ) -> tuple:
     """Recall@k: (full dequantization, quantized-score + rerank) for one k.
 
@@ -170,16 +174,22 @@ def recall_pipelines(
 
     ``true`` (exact (n_q, n_db) inner products) is the evaluation oracle used
     to measure recall and to rerank; the rerank path reads back only the C
-    candidate columns of ``X``.
+    candidate columns of ``X``. ``presorted`` optionally carries the sorted
+    top-k selections ``(true_sorted, baseline_sorted, scan_sorted)`` computed
+    once per trial (at k = max ks / C = cand_scale * max ks) and sliced here.
     """
     n_q = Q.shape[0]
-    true_topk = _topk(true, k)
-
-    full_topk = _topk(S_baseline, k)
-    recall_full = recall_at_k(full_topk, true_topk)
+    if presorted is None:
+        true_sorted = _topk(true, k)
+        baseline_sorted = _topk(S_baseline, k)
+        scan_sorted = _topk(S_scan, cand_scale * k)
+    else:
+        true_sorted, baseline_sorted, scan_sorted = presorted
+    true_topk = true_sorted[:, :k]
+    recall_full = recall_at_k(baseline_sorted[:, :k], true_topk)
 
     C = cand_scale * k
-    cand = _topk(S_scan, C)                       # (n_q, C) candidate set
+    cand = scan_sorted[:, :C]                     # (n_q, C) candidate set
     rows = np.arange(n_q)[:, None]
     exact_cand = np.einsum("qcd,qd->qc", X[cand], Q)   # <q, x_j> for candidates only
     order_c = np.argsort(-exact_cand, axis=1)[:, :k]
@@ -210,7 +220,10 @@ def ann_recall_trial(
     codes = product_codes(X, R, codebook)
     S_scan = quantized_scores_scan(Q, codes, codebook, R)   # P3.7: scan over codes
     S_full = full_dequant_scores(Q, codes, codebook, R)     # baseline: dequantize all
+    k_max = max(ks)
+    C_max = cand_scale * k_max
+    presorted = (_topk(true, k_max), _topk(S_full, k_max), _topk(S_scan, C_max))
     return {
-        k: recall_pipelines(Q, X, S_full, S_scan, true, k, cand_scale)
+        k: recall_pipelines(Q, X, S_full, S_scan, true, k, cand_scale, presorted)
         for k in ks
     }
