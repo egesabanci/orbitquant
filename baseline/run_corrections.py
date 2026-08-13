@@ -53,6 +53,7 @@ def main(argv=None) -> int:
     modes = ["mse", "debiased", "norm_preserving"]
     print(f"{'mode':<16}{'bias_ratio':>12}{'mse':>10}{'unbiased?':>10}")
     print("-" * 48)
+    results = {}
     for mode in modes:
         bias_ests = np.empty(n_rot)
         mse_ests = np.empty(n_rot)
@@ -69,7 +70,32 @@ def main(argv=None) -> int:
         bias_ratio = float(np.mean(bias_ests) / true)
         mse = float(np.mean(mse_ests))
         unbiased = abs(bias_ratio - 1.0) < 0.05
+        results[mode] = {"bias_ratio": bias_ratio, "mse": mse, "unbiased": unbiased}
         print(f"{mode:<16}{bias_ratio:>12.4f}{mse:>10.4f}{str(unbiased):>10}")
+
+    # P1.1 mixed-mode policy: choose the mode that best satisfies the objective.
+    # Two policies:
+    #   - 'min_mse_unbiased': lowest MSE among unbiased modes (debiased if it
+    #     is unbiased, else product).
+    #   - 'min_bias_at_cost': lowest bias for a bounded MSE increase.
+    print()
+    print("P1.1 mixed-mode policy selection:")
+    # Policy A: prefer unbiased, lowest MSE among unbiased modes
+    unbiased_modes = [m for m, r in results.items() if r["unbiased"]]
+    if unbiased_modes:
+        best = min(unbiased_modes, key=lambda m: results[m]["mse"])
+        print(f"  min_mse_unbiased: {best} (mse={results[best]['mse']:.4f})")
+    else:
+        print("  min_mse_unbiased: none unbiased (would need product mode)")
+    # Policy B: lowest bias for MSE within 1.5x of plain MSE
+    mse_mse = results["mse"]["mse"]
+    affordable = [m for m, r in results.items() if r["mse"] <= 1.5 * mse_mse]
+    if affordable:
+        best = min(affordable, key=lambda m: abs(results[m]["bias_ratio"] - 1.0))
+        print(f"  min_bias_within_1.5x_mse: {best} "
+              f"(bias={results[best]['bias_ratio']:.4f}, mse={results[best]['mse']:.4f})")
+    else:
+        print("  min_bias_within_1.5x_mse: none affordable")
 
     return 0
 
