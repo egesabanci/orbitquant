@@ -26,10 +26,15 @@ from . import rotations as rot
 
 
 def eval_rotation(name: str, d: int, n_rot: int, rng: np.random.Generator, b: int = 1):
-    """Run the statistical checks for one rotation transform."""
+    """Run the statistical checks for one rotation transform.
+
+    ``b`` is the TOTAL bit budget. The MSE base uses a (b-1)-bit codebook and
+    the residual QJL adds 1 bit per coordinate, matching TurboQuant Algorithm 2
+    (paper lines 715-750): total = (b-1) + 1 = b bits.
+    """
     x = pr.fixed_vector(d)
     y = pr.fixed_vector(d, kind="all_equal")
-    cbk = cb.beta_lloyd_max(d, b)
+    cbk = cb.beta_lloyd_max(d, b - 1)  # MSE base at b-1 bits
 
     samples = np.empty(n_rot * d)
     mse = 0.0
@@ -37,16 +42,16 @@ def eval_rotation(name: str, d: int, n_rot: int, rng: np.random.Generator, b: in
     prod_ests = np.empty(n_rot)
     t0 = time.perf_counter()
     for i in range(n_rot):
-        P = rot.rotation_from_name(name, d, rng)
-        yx = P @ x
+        R = rot.rotation_from_name(name, d, rng)  # Rotation object
+        yx = R.forward(x)
         samples[i * d : (i + 1) * d] = yx
         idx = cb.quantize(yx, cbk)
         yhat = cb.dequantize(idx, cbk)
         mse += float(np.sum((yx - yhat) ** 2))
-        xhat = P.T @ yhat
+        xhat = R.inverse(yhat)
         bias_ests[i] = np.dot(y, xhat)
         # Full TurboQuant-product estimator (Algorithm 2): MSE base score plus
-        # the QJL residual, scaled by ||r||. This is what Lemma 4 bounds.
+        # the QJL residual, scaled by ||r||. Total bits = (b-1) + 1 = b.
         r = x - xhat
         gamma = np.linalg.norm(r)
         S = rng.standard_normal((d, d))
@@ -59,8 +64,10 @@ def eval_rotation(name: str, d: int, n_rot: int, rng: np.random.Generator, b: in
     mse /= n_rot
     true = float(np.dot(y, x))
     bias_ratio = float(np.mean(bias_ests) / true)
-    floor = 1.0 / (4**b)
-    gap = mse / floor
+    # Base MSE metrics use the b-1 bit codebook and its own floor 1/4^(b-1).
+    mse_bits = b - 1
+    base_floor = 1.0 / (4**mse_bits)
+    base_gap = mse / base_floor
 
     # covariance / higher-order dependence: distinct rotated coords ~independent
     Y = samples.reshape(n_rot, d)
@@ -72,11 +79,12 @@ def eval_rotation(name: str, d: int, n_rot: int, rng: np.random.Generator, b: in
     rhs = np.mean(c1**2) * np.mean(c2**2)
     factor_gap = float(abs(lhs - rhs) / (rhs + 1e-12))
 
-    # Full product estimator: bias and variance vs the Lemma 4/Thm 2 bound
+    # Full product estimator at total b bits: bias and variance vs the formal
+    # Theorem 2 bound Dprod <= pi/(2d)*||y||^2*Dmse(b-1) (paper lines 817-851),
+    # where Dmse(b-1) is the measured base MSE. This varies per rotation.
     prod_bias = float(np.mean(prod_ests) - true)
     prod_var = float(np.var(prod_ests))
-    # Thm 2 bound: (sqrt(3)pi/2)*||y||^2/d * 1/4^b
-    prod_bound = (np.sqrt(3) * np.pi / 2) * np.dot(y, y) / d / (4**b)
+    prod_bound = (np.pi / 2) / d * np.dot(y, y) * mse
 
     return {
         "rotation": name,
@@ -88,7 +96,7 @@ def eval_rotation(name: str, d: int, n_rot: int, rng: np.random.Generator, b: in
         "prod_bias": prod_bias,
         "prod_var": prod_var,
         "prod_bound": prod_bound,
-        "near_optimality_gap": gap,
+        "near_optimality_gap": base_gap,
         "runtime_s": elapsed,
     }
 
@@ -99,6 +107,10 @@ def main(argv=None) -> int:
     ap.add_argument("--nrot", type=int, default=2000)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument(
+        "--b", type=int, default=2,
+        help="total bit budget; MSE base uses b-1 bits + 1-bit residual QJL",
+    )
+    ap.add_argument(
         "--rotations",
         nargs="*",
         default=["haar", "hadamard", "hd", "hdhd", "hdhdh", "perm"],
@@ -108,21 +120,21 @@ def main(argv=None) -> int:
     rng = np.random.default_rng(args.seed)
     d, n_rot = args.d, args.nrot
 
-    print(f"P0.1 Rotation validation harness  d={d} nrot={n_rot} seed={args.seed}")
+    print(f"P0.1 Rotation validation harness  d={d} nrot={n_rot} b={args.b} seed={args.seed}")
     print(f"{'rotation':<10}{'beta_ks':>9}{'rms_corr':>10}{'fact_gap':>9}"
-          f"{'mse':>9}{'bias':>9}{'p_bias':>9}{'p_var':>9}{'opt_gap':>9}{'rt_s':>7}")
-    print("-" * 90)
+          f"{'mse':>9}{'bias':>9}{'p_bias':>9}{'p_var':>9}{'p_bound':>9}{'opt_gap':>9}{'rt_s':>7}")
+    print("-" * 100)
     for name in args.rotations:
-        r = eval_rotation(name, d, n_rot, rng)
+        r = eval_rotation(name, d, n_rot, rng, b=args.b)
         print(f"{r['rotation']:<10}{r['beta_ks']:>9.4f}{r['rms_corr']:>10.4f}"
               f"{r['factor_gap']:>9.4f}{r['mse']:>9.4f}{r['bias_ratio']:>9.4f}"
-              f"{r['prod_bias']:>9.4f}{r['prod_var']:>9.4f}"
+              f"{r['prod_bias']:>9.4f}{r['prod_var']:>9.4f}{r['prod_bound']:>9.4f}"
               f"{r['near_optimality_gap']:>9.3f}{r['runtime_s']:>7.3f}")
 
     # reference values for the ideal Haar rotation
-    print("-" * 90)
-    print("Reference (Haar, d=64): beta_ks~0.002, rms_corr~0.02, mse~0.36, "
-          "bias~0.637, prod_bias~0, prod_var<bound, opt_gap~1.44")
+    print("-" * 100)
+    print(f"Reference (Haar, d=64, b={args.b}): beta_ks~0.002, rms_corr~0.02, "
+          "mse~0.36, bias~0.637, prod_bias~0, prod_var<prod_bound, opt_gap~1.44")
     return 0
 
 
